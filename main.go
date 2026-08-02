@@ -1,23 +1,27 @@
-// ShiftEncryption v3.2 — prototype de recherche
+// ShiftEncryption v4.0 — prototype de recherche
 //
 //	COUCHE 1 : RLWE sur R_q = Z_q[X]/(X^N+1), N=1024, Q~2^54
-//	COUCHE 2 : 16 cartes logistiques couplées, double round/pas (128 o/pas)
-//	           état initial sécurisé via Ring-LWR (réductible à Ring-LWE)
+//	COUCHE 2 : squelette ARX Threefish-1024 (80 rounds, rotations/permutation
+//	           vérifiées depuis la spec Skein v1.3), feed-forward MMO,
+//	           blanchiment final via fonction non-linéaire "lg" (touche Shift)
 //	COUCHE 3 : XOR 128 o/pas, AVX2 4×VPXOR(256b), goroutines seekables
 //	COUCHE 4 : MAC HMAC-SHA256 sur mode+len+C0+C1+stream (authentification totale)
 //
-// Améliorations v3 vs v2 :
+// Historique :
 //
-//	Clé publique : 16 KB → 7 KB  (seed pour A + bit-packing 55 bits/coeff)
-//	Clé privée   : 8 KB  → 1 KB  (coefficients Gaussiens ∈ [-32,32] → int8)
-//	Performance  : 8 lanes → 16 lanes, blocs XOR 64 o → 128 o
-//	Sécurité     : état initial chaotique dérivé via Ring-LWR
-//	               (récupérer l'état = résoudre Ring-LWE)
-//	v3.1         : AEAD MAC, output hex/base64, burn 32 rounds, fixes NTT
-//	v3.2         : double round de diffusion par pas (lanes distantes,
-//	               rotation 41 vs 17), burn 48 rounds, MAC dérivé via HMAC
-//	               (séparation de domaine) et élargi à tout le CipherData
-//	               (mode+len+C0+C1+stream, plus juste le stream)
+//	v3.0 : réécriture initiale (clé publique 16→7 Ko, privée 8→1 Ko, 8→16 lanes)
+//	v3.1 : AEAD MAC, output hex/base64, burn 32 rounds, fixes NTT
+//	v3.2 : double round par pas, burn 48 rounds, MAC élargi à tout le CipherData
+//	v4.0 : couche 2 entièrement reconstruite sur le squelette Threefish-1024
+//	       (Ferguson/Lucks/Schneier et al., finaliste NIST SHA-3) — rotations
+//	       et permutation vérifiées depuis l'implémentation de référence,
+//	       80 rounds (marge de sécurité identique à Threefish), sous-clés
+//	       dérivées du seed via HKDF, feed-forward Matyas-Meyer-Oseas (comme
+//	       Skein transforme Threefish en fonction à sens unique), mode
+//	       compteur par bloc (plus d'état continu entre blocs). La fonction
+//	       "lg" originale de Shift est conservée en blanchiment final.
+//	       Débit : ~40x plus lent qu'en v3.2 (80 rounds vs 2) — contrepartie
+//	       assumée pour un squelette de diffusion analysé publiquement.
 //
 // Commandes :
 //
@@ -598,9 +602,129 @@ func splitmix64(z uint64) uint64 {
 	return z
 }
 
+// v4.0 : squelette de diffusion emprunté à Threefish-1024 (Ferguson, Lucks,
+// Schneier, Whiting, Bellare, Kohno, Callas, Walker — cœur de Skein,
+// finaliste NIST SHA-3, spec v1.3). Threefish-1024 opère sur exactement
+// 16 mots de 64 bits — identique à notre structure Lanes=16 — avec un
+// planning de rotations et une permutation analysés publiquement pendant
+// la compétition SHA-3 (meilleure attaque publique : ~57/72 rounds sur
+// Threefish-512, soit un facteur de marge ~1.3 à pleine échelle — nous
+// reprenons le nombre de rounds complet, 80, pour la même marge).
+//
+// Ce qu'on emprunte à Threefish-1024 (constantes vérifiées depuis
+// l'implémentation de référence, domaine public / ISC license) :
+//   - la table de rotations 8×8 (motif qui se répète tous les 8 rounds)
+//   - la permutation fixe des 16 mots appliquée après chaque round
+//   - l'injection de sous-clé tous les 4 rounds
+//   - le nombre total de rounds (80)
+//
+// Ce qui reste original à Shift :
+//   - la dérivation des sous-clés depuis le seed RLWE (pas une vraie
+//     key schedule Threefish — on n'a pas besoin de la réversibilité
+//     d'un chiffrement par bloc, juste d'une permutation à sens unique)
+//   - le feed-forward Matyas-Meyer-Oseas final (out = E(state) XOR state),
+//     exactement la technique que Skein utilise pour transformer
+//     Threefish — un chiffrement par bloc — en fonction à sens unique
+//     adaptée à un usage de flux/PRF plutôt que de chiffrement par bloc
+//   - la fonction non-linéaire "lg" (multiplication haute) appliquée en
+//     blanchiment final — la vraie touche perso Shift, en plus du
+//     squelette ARX emprunté, pas à la place
+
+const (
+	tfRounds      = 80 // = Threefish-1024 (marge de sécurité identique)
+	tfSubkeyEvery = 4
+	tfNumSubkeys  = tfRounds/tfSubkeyEvery + 1 // 21
+)
+
+// tfRot : table de rotations 8×8, motif se répétant tous les 8 rounds.
+// Valeurs copiées telles quelles depuis l'implémentation de référence
+// Threefish-1024 (schultz-is/go-threefish, elle-même dérivée de la
+// spec Skein v1.3 officielle).
+var tfRot = [8][8]uint64{
+	{24, 13, 8, 47, 8, 17, 22, 37},
+	{38, 19, 10, 55, 49, 18, 23, 52},
+	{33, 4, 51, 13, 34, 41, 59, 17},
+	{5, 20, 48, 41, 47, 28, 16, 25},
+	{41, 9, 37, 31, 12, 47, 44, 30},
+	{16, 34, 56, 51, 4, 53, 42, 41},
+	{31, 44, 47, 46, 19, 42, 44, 25},
+	{9, 48, 35, 52, 23, 31, 37, 20},
+}
+
+// tfPerm : permutation fixe des 16 mots, appliquée après chaque round.
+// new[i] = old[tfPerm[i]]. Copiée telle quelle depuis la même référence.
+var tfPerm = [Lanes]int{0, 9, 2, 13, 6, 11, 4, 15, 10, 7, 12, 3, 14, 5, 8, 1}
+
+// lg : fonction non-linéaire multiplicative — la touche perso Shift,
+// conservée comme blanchiment final (pas dans le squelette ARX lui-même).
+func lg(x uint64) uint64 { hi, _ := bits.Mul64(x, ^x); return hi << 2 }
+
+// hkdfExpand : expansion HMAC-SHA256 en mode compteur (HKDF-Expand simplifié,
+// seed déjà haute-entropie donc pas de phase Extract nécessaire).
+func hkdfExpand(seed *[SeedSize]byte, label string, nBytes int) []byte {
+	out := make([]byte, 0, nBytes+sha256.Size)
+	var counter byte = 1
+	var prev []byte
+	for len(out) < nBytes {
+		mac := hmac.New(sha256.New, seed[:])
+		mac.Write(prev)
+		mac.Write([]byte(label))
+		mac.Write([]byte{counter})
+		prev = mac.Sum(nil)
+		out = append(out, prev...)
+		counter++
+	}
+	return out[:nBytes]
+}
+
+// c240 : constante "nothing-up-my-sleeve" du key schedule Threefish
+// (= XOR de tous les mots de clé, valeur fixe publiée dans la spec Skein v1.3).
+const c240 = 0x1BD11BDAA9FC1A22
+
+// threefishKeySchedule v4.1 : reproduit fidèlement la formule de key schedule
+// de Threefish (spec Skein v1.3, §3.3) au lieu d'un simple HKDF plat.
+//   - la "clé" (16 mots / 1024 bits) est dérivée du seed RLWE via HKDF
+//     (on n'a pas de clé brute de 1024 bits à donner en entrée — c'est
+//     l'adaptation nécessaire, le reste suit la formule d'origine)
+//   - le "tweak" encode le contexte (index de chunk) — équivalent au
+//     mécanisme UBI de Skein qui personnalise le chiffrement par position
+//   - chaque sous-clé mélange clé+tweak+numéro de round, cassant toute
+//     symétrie entre les 21 sous-clés (contre les attaques par glissement)
+func threefishKeySchedule(seed *[SeedSize]byte, chunkIndex uint64) [tfNumSubkeys][Lanes]uint64 {
+	keyBytes := hkdfExpand(seed, "ShiftTF-v4.1-key", Lanes*8)
+	var k [Lanes + 1]uint64
+	k[Lanes] = c240
+	for i := 0; i < Lanes; i++ {
+		k[i] = binary.LittleEndian.Uint64(keyBytes[i*8:])
+		k[Lanes] ^= k[i]
+	}
+
+	var t [3]uint64
+	t[0] = chunkIndex
+	t[1] = chunkIndex ^ 0x5348494654563430 // "SHIFTV40" — constante de contexte
+	t[2] = t[0] ^ t[1]
+
+	var ks [tfNumSubkeys][Lanes]uint64
+	for s := 0; s < tfNumSubkeys; s++ {
+		for i := 0; i < Lanes; i++ {
+			ks[s][i] = k[(s+i)%(Lanes+1)]
+			switch i {
+			case Lanes - 3:
+				ks[s][i] += t[s%3]
+			case Lanes - 2:
+				ks[s][i] += t[(s+1)%3]
+			case Lanes - 1:
+				ks[s][i] += uint64(s)
+			}
+		}
+	}
+	return ks
+}
+
 type chaoticStream struct {
-	x [Lanes]uint64
-	w [Lanes]uint64
+	base     [Lanes]uint64 // état fixe par chunk (seed + LWR + index de chunk)
+	subkeys  [tfNumSubkeys][Lanes]uint64
+	blockCtr uint64 // compteur de bloc — chaque step() est indépendant (mode compteur)
 }
 
 func newChaoticStream(lwrBase LWRState, seed *[SeedSize]byte, chunkIndex uint64) chaoticStream {
@@ -613,96 +737,62 @@ func newChaoticStream(lwrBase LWRState, seed *[SeedSize]byte, chunkIndex uint64)
 		h := splitmix64(s0 + weylGamma[i])
 		h = splitmix64(h ^ s1 ^ bits.RotateLeft64(chunkIndex, 13+i))
 		h = splitmix64(h + s2 + uint64(i)*0x9E3779B97F4A7C15)
-		cs.x[i] = (h | 1) ^ lwrBase[i]
-		cs.w[i] = splitmix64(h ^ s3 ^ chunkIndex)
+		cs.base[i] = (h | 1) ^ lwrBase[i]
 	}
-	// v3.2 : 48 rounds de burn (était 32 en v3.1, 16 en v3.0) pour éliminer
-	// les corrélations initiales — marge supplémentaire vu que step() fait
-	// maintenant 2 passages de diffusion par appel (round A + round B).
-	var burn [128]byte
-	for i := 0; i < 48; i++ {
-		cs.step(&burn)
-	}
+	_ = s3
+
+	cs.subkeys = threefishKeySchedule(seed, chunkIndex)
 	return cs
 }
 
-// step v3.2 : deux passages de diffusion par pas.
-//
-//	Round A — mélange lanes adjacentes (offset +1, rotation 17), comme v3.1
-//	Round B — mélange lanes distantes (offset +3, rotation 41), casse les
-//	          corrélations locales qu'un seul round laisse subsister et
-//	          fait qu'un octet de sortie dépend de 2 lanes d'entrée en
-//	          plus par rapport à v3.1 (meilleur effet avalanche par pas).
-func (cs *chaoticStream) step(out *[128]byte) {
-	x0, x1, x2, x3 := cs.x[0], cs.x[1], cs.x[2], cs.x[3]
-	x4, x5, x6, x7 := cs.x[4], cs.x[5], cs.x[6], cs.x[7]
-	x8, x9, x10, x11 := cs.x[8], cs.x[9], cs.x[10], cs.x[11]
-	x12, x13, x14, x15 := cs.x[12], cs.x[13], cs.x[14], cs.x[15]
 
-	for i := range cs.w {
-		cs.w[i] += weylGamma[i]
+// step : génère 128 octets de keystream. Chaque appel est indépendant
+// (mode compteur, comme AES-CTR/ChaCha) — pas d'état continu entre blocs,
+// ce qui évite toute corrélation accumulée entre blocs successifs.
+//
+//	1. état de travail = base XOR compteur de bloc
+//	2. 80 rounds Threefish-1024 (MIX + permutation, sous-clé tous les 4 rounds)
+//	3. feed-forward Matyas-Meyer-Oseas : état final XOR état initial
+//	4. blanchiment final via lg() + splitmix64 (touche perso Shift)
+func (cs *chaoticStream) step(out *[128]byte) {
+	var w [Lanes]uint64
+	copy(w[:], cs.base[:])
+	w[Lanes-1] ^= cs.blockCtr
+	orig := w
+
+	subkeyIdx := 0
+	for round := 0; round < tfRounds; round++ {
+		if round%tfSubkeyEvery == 0 {
+			sk := cs.subkeys[subkeyIdx]
+			for i := 0; i < Lanes; i++ {
+				w[i] += sk[i]
+			}
+			subkeyIdx++
+		}
+		rot := tfRot[round%8]
+		for pair := 0; pair < Lanes/2; pair++ {
+			a, b := 2*pair, 2*pair+1
+			w[a] += w[b]
+			w[b] = bits.RotateLeft64(w[b], int(rot[pair])) ^ w[a]
+		}
+		var p [Lanes]uint64
+		for i := 0; i < Lanes; i++ {
+			p[i] = w[tfPerm[i]]
+		}
+		w = p
+	}
+	// sous-clé finale (21e, après le dernier round — comme Threefish)
+	sk := cs.subkeys[tfNumSubkeys-1]
+	for i := 0; i < Lanes; i++ {
+		w[i] += sk[i]
 	}
 
-	lg := func(x uint64) uint64 { hi, _ := bits.Mul64(x, ^x); return hi << 2 }
-
-	// Round A (offset +1, rotation 17)
-	mx0 := lg(x0) ^ bits.RotateLeft64(x1, 17) + cs.w[0]
-	mx1 := lg(x1) ^ bits.RotateLeft64(x2, 17) + cs.w[1]
-	mx2 := lg(x2) ^ bits.RotateLeft64(x3, 17) + cs.w[2]
-	mx3 := lg(x3) ^ bits.RotateLeft64(x4, 17) + cs.w[3]
-	mx4 := lg(x4) ^ bits.RotateLeft64(x5, 17) + cs.w[4]
-	mx5 := lg(x5) ^ bits.RotateLeft64(x6, 17) + cs.w[5]
-	mx6 := lg(x6) ^ bits.RotateLeft64(x7, 17) + cs.w[6]
-	mx7 := lg(x7) ^ bits.RotateLeft64(x8, 17) + cs.w[7]
-	mx8 := lg(x8) ^ bits.RotateLeft64(x9, 17) + cs.w[8]
-	mx9 := lg(x9) ^ bits.RotateLeft64(x10, 17) + cs.w[9]
-	mx10 := lg(x10) ^ bits.RotateLeft64(x11, 17) + cs.w[10]
-	mx11 := lg(x11) ^ bits.RotateLeft64(x12, 17) + cs.w[11]
-	mx12 := lg(x12) ^ bits.RotateLeft64(x13, 17) + cs.w[12]
-	mx13 := lg(x13) ^ bits.RotateLeft64(x14, 17) + cs.w[13]
-	mx14 := lg(x14) ^ bits.RotateLeft64(x15, 17) + cs.w[14]
-	mx15 := lg(x15) ^ bits.RotateLeft64(x0, 17) + cs.w[15]
-
-	// Round B (offset +3, rotation 41) — couplage à distance
-	nx0 := lg(mx0) ^ bits.RotateLeft64(mx3, 41) + cs.w[3]
-	nx1 := lg(mx1) ^ bits.RotateLeft64(mx4, 41) + cs.w[4]
-	nx2 := lg(mx2) ^ bits.RotateLeft64(mx5, 41) + cs.w[5]
-	nx3 := lg(mx3) ^ bits.RotateLeft64(mx6, 41) + cs.w[6]
-	nx4 := lg(mx4) ^ bits.RotateLeft64(mx7, 41) + cs.w[7]
-	nx5 := lg(mx5) ^ bits.RotateLeft64(mx8, 41) + cs.w[8]
-	nx6 := lg(mx6) ^ bits.RotateLeft64(mx9, 41) + cs.w[9]
-	nx7 := lg(mx7) ^ bits.RotateLeft64(mx10, 41) + cs.w[10]
-	nx8 := lg(mx8) ^ bits.RotateLeft64(mx11, 41) + cs.w[11]
-	nx9 := lg(mx9) ^ bits.RotateLeft64(mx12, 41) + cs.w[12]
-	nx10 := lg(mx10) ^ bits.RotateLeft64(mx13, 41) + cs.w[13]
-	nx11 := lg(mx11) ^ bits.RotateLeft64(mx14, 41) + cs.w[14]
-	nx12 := lg(mx12) ^ bits.RotateLeft64(mx15, 41) + cs.w[15]
-	nx13 := lg(mx13) ^ bits.RotateLeft64(mx0, 41) + cs.w[0]
-	nx14 := lg(mx14) ^ bits.RotateLeft64(mx1, 41) + cs.w[1]
-	nx15 := lg(mx15) ^ bits.RotateLeft64(mx2, 41) + cs.w[2]
-
-	cs.x[0], cs.x[1], cs.x[2], cs.x[3] = nx0, nx1, nx2, nx3
-	cs.x[4], cs.x[5], cs.x[6], cs.x[7] = nx4, nx5, nx6, nx7
-	cs.x[8], cs.x[9], cs.x[10], cs.x[11] = nx8, nx9, nx10, nx11
-	cs.x[12], cs.x[13], cs.x[14], cs.x[15] = nx12, nx13, nx14, nx15
-
-	ou := (*[16]uint64)(unsafe.Pointer(out))
-	ou[0] = splitmix64(nx0)
-	ou[1] = splitmix64(nx1)
-	ou[2] = splitmix64(nx2)
-	ou[3] = splitmix64(nx3)
-	ou[4] = splitmix64(nx4)
-	ou[5] = splitmix64(nx5)
-	ou[6] = splitmix64(nx6)
-	ou[7] = splitmix64(nx7)
-	ou[8] = splitmix64(nx8)
-	ou[9] = splitmix64(nx9)
-	ou[10] = splitmix64(nx10)
-	ou[11] = splitmix64(nx11)
-	ou[12] = splitmix64(nx12)
-	ou[13] = splitmix64(nx13)
-	ou[14] = splitmix64(nx14)
-	ou[15] = splitmix64(nx15)
+	ou := (*[Lanes]uint64)(unsafe.Pointer(out))
+	for i := 0; i < Lanes; i++ {
+		mmo := w[i] ^ orig[i] // feed-forward Matyas-Meyer-Oseas
+		ou[i] = splitmix64(mmo) ^ lg(mmo)
+	}
+	cs.blockCtr++
 }
 
 // ============================================================================
@@ -932,7 +1022,7 @@ func DecryptFile(inPath, outPath string, priv PrivateKey) error {
 // SÉRIALISATION v3.1
 //   Clé publique  "SHFTPUB3" + seedA[32] + B_packed[7040]         = 7080 o
 //   Clé privée    "SHFTKEY3" + S_int8[1024]                       = 1032 o
-//   Ciphertext    "SHFTCT3"  + mode(1) + C0 + C1 + mac[32] + len(8) + stream
+//   Ciphertext    "SHFTCT4"  + mode(1) + C0 + C1 + mac[32] + len(8) + stream
 // ============================================================================
 
 func writePolyBuf(dst []byte, p []uint64) []byte {
@@ -1011,7 +1101,7 @@ func LoadPrivateKey(path string) (PrivateKey, error) {
 func SerializeCipher(ct CipherData) []byte {
 	packed := (bitsPerCoeff*N + 7) / 8
 	buf := make([]byte, 0, 8+1+2*packed+MacSize+8+len(ct.Stream))
-	buf = append(buf, "SHFTCT3"...)
+	buf = append(buf, "SHFTCT4"...)
 	buf = append(buf, byte(ct.Mode))
 	buf = writePolyBuf(buf, ct.C0)
 	buf = writePolyBuf(buf, ct.C1)
@@ -1027,8 +1117,8 @@ func SerializeCipher(ct CipherData) []byte {
 }
 
 func DeserializeCipher(data []byte) (CipherData, error) {
-	if len(data) < 8 || string(data[:7]) != "SHFTCT3" {
-		return CipherData{}, errors.New("pas un ciphertext ShiftEncryption v3")
+	if len(data) < 8 || string(data[:7]) != "SHFTCT4" {
+		return CipherData{}, errors.New("pas un ciphertext ShiftEncryption v4")
 	}
 	ct := CipherData{Mode: Mode(data[7])}
 	packed := (bitsPerCoeff*N + 7) / 8
@@ -1269,7 +1359,7 @@ func cmdBench(args []string) {
 		fatal("%v", err)
 	}
 
-	fmt.Printf("Benchmark ShiftEncryption v3.1 — %d MiB × %d iter — %d cœurs\n\n", *sizeMB, *iters, runtime.NumCPU())
+	fmt.Printf("Benchmark ShiftEncryption v4.0 — %d MiB × %d iter — %d cœurs\n\n", *sizeMB, *iters, runtime.NumCPU())
 
 	pub, priv := GenerateKeyPair()
 
@@ -1336,7 +1426,7 @@ func cmdBench(args []string) {
 // ============================================================================
 
 func usage() {
-	fmt.Printf(`ShiftEncryption v3.2 — RLWE N=%d Q~2^54 + 16 lanes (double round) + Ring-LWR + HMAC-SHA256
+	fmt.Printf(`ShiftEncryption v4.0 — RLWE N=%d Q~2^54 + 16 lanes (double round) + Ring-LWR + HMAC-SHA256
 
 Commandes :
   keygen   [-key prefix]                         Génère une paire de clés
