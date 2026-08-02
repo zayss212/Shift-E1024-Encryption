@@ -74,6 +74,14 @@ mode+len+C0+C1+     │   HMAC-SHA256         │───▶ MAC (32 octets)
 - Clé privée : **~1 Ko** (coefficients gaussiens ∈ [-32, 32], stockés en `int8`)
 - Débit : chiffrement/déchiffrement parallélisés sur tous les cœurs disponibles
 
+### Un avantage structurel : deux clés, pas une seule
+
+AES-256 (comme tout chiffrement symétrique) repose sur **une seule clé partagée** : la même sert à chiffrer et déchiffrer. Ça implique un problème non résolu par AES lui-même — comment transmettre cette clé à l'autre partie sans qu'elle soit interceptée ? En pratique, AES seul ne répond jamais à cette question ; il faut lui adjoindre autre chose (échange manuel, canal séparé, ou un mécanisme d'échange de clé comme ECDH).
+
+ShiftEncryption, via sa couche RLWE, est nativement **asymétrique** : une clé publique (`.pub`) pour chiffrer, une clé privée (`.key`) pour déchiffrer. La clé publique peut être diffusée librement — même interceptée, elle ne permet pas de déchiffrer. C'est un vrai avantage architectural pour tout scénario où la clé de déchiffrement doit rester à un seul endroit (ex. : un backend qui doit être seul capable de lire des fichiers uploadés par des clients qui n'ont besoin que de la clé publique).
+
+**Nuance importante** : la comparaison honnête n'est pas "Shift vs AES nu", mais "Shift vs KEM+AES" — en pratique, personne ne déploie AES seul pour de l'asymétrique ; on le combine toujours avec un mécanisme d'échange de clé (ECDH, RSA-OAEP, ou un KEM post-quantique comme ML-KEM/Kyber), exactement comme TLS le fait. La couche RLWE de ce projet joue ce rôle de KEM. L'avantage réel de Shift ici, c'est d'intégrer nativement un KEM **post-quantique** dans un seul binaire, sans dépendance externe — pas d'inventer un concept qu'AES n'aurait pas. Ça ne change rien non plus au point central de la section [Sécurité](#sécurité--lire-avant-utilisation) : la couche RLWE est solide, la couche chaotique reste heuristique.
+
 ## Installation
 
 Nécessite [Go 1.22+](https://go.dev/dl/).
@@ -198,3 +206,7 @@ Les contributions sont bienvenues, en particulier :
 - Analyse cryptographique de la couche chaotique (différentielle, linéaire, algébrique)
 - Vérification des paramètres RLWE via un [LWE estimator](https://github.com/malb/lattice-estimator)
 - Tests supplémentaires, fuzzing, vecteurs de test
+
+## Licence
+
+*(à compléter selon votre choix — MIT, Apache 2.0, GPL, etc.)*
